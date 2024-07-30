@@ -1,0 +1,51 @@
+# config.yaml
+program: vqvae-selfies-wandb-sweep.py
+# random, grid, bayes. See https://docs.wandb.ai/guides/sweeps/define-sweep-configuration
+method: random
+metric:
+  goal: minimize
+  name: loss
+parameters:
+  random_seed:
+    value: 1000
+  device:
+    value: "cuda"
+  selfies:
+    parameters:
+      csv_path: 
+        value: "/root/data/drug-discovery/1Mstoned_vsc_initial_dataset_insilico_chemistry42_filtered.csv"
+      # takes precedence
+      pickle_path:
+        value: "/root/data/drug-discovery/selfies-1M.pkl"
+  vqvae:
+    parameters:
+      embedding_dim:
+        values: [2, 8, 32, 128, 256, 512, 1024, 2048]
+      hidden_dim:
+        values: [2, 8, 32, 128, 256, 512, 1024, 2048]
+      residual_layer_hidden_dim:
+        values: [2, 8, 32, 128, 256, 512, 1024, 2048]
+      n_codes: 
+        values: [2, 8, 32, 128, 256, 512, 1024, 2048]
+      hidden_act:
+        values: [
+          "relu", 
+          "leaky_relu",
+          "selu",
+          "gelu",
+          "prelu"
+        ]
+      leaky_relu_alpha:
+        values: [0.01, 0.1, 1.0, 0.001]
+      batch_size: 
+        values: [256,512]
+      optimizer:
+        parameters:
+          lr:
+            values: [0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001]
+          beta1:
+            values: [0.85, 0.88, 0.90, 0.92, 0.95]
+          beta2:
+            values: [0.990, 0.995, 0.999]
+      n_epochs:
+        values: [5, 10, 15, 20]
