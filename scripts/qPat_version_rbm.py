@@ -8,11 +8,17 @@ import tqdm
 import numpy as np
 from qumedl.mol.encoding.selfies_ import Selfies
 from qumedl.models.transformer.pat import CausalMolPAT
-from qumedl.models.transformer.loss_functions import compute_transformer_loss
+from qumedl.models.transformer.loss_functions import (
+    compute_transformer_loss,
+    compute_transformer_loss_vlad,
+)
 from qumedl.training.collator import TensorBatchCollator
 from qumedl.training.tensor_batch import TensorBatch
 from qumedl.models.activations import NewGELU
 from qumedl.models.priors import GaussianPrior
+from orquestra.drug.discovery.docking.utils import process_molecule
+from orquestra.drug.discovery.validator.filter_abstract import FilterAbstract
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # from qumedl.models.priors import QCBMPrior
 from orquestra.drug.discovery.validator import (
@@ -30,13 +36,6 @@ import sys
 import torch
 import torch.nn as nn
 import cloudpickle
-from qcbm.qcbm_ibm import SingleBasisQCBM
-from qcbm.circuit import LineEntanglingLayerBuilder, EntanglingLayerAnsatz
-from qcbm.loss import ExactNLLTorch
-from qcbm.optimizer import ScipyOptimizer
-from qiskit_ibm_runtime import QiskitRuntimeService, Session
-from qiskit.primitives import Sampler
-from qiskit_aer import Aer
 
 ## RBM
 import optax
@@ -44,11 +43,29 @@ from orquestra.qml.models.rbm.jx import RBM
 from orquestra.qml.api import Batch
 
 # Initialize Qiskit Runtime Service with specific credentials
-service = QiskitRuntimeService(name="ibm_uoft")
-backend = service.backend("ibm_quebec")  # Using IBM Quebec backend
+import pickle
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
-backend = Aer.get_backend("aer_simulator")
+class TartarusFilters(FilterAbstract):
+    def apply(self, smile: str):
+        _, status = process_molecule(smile)
+        if status == "PASS":
+            return True
+        return False
+
+
+def save_object(obj, filename):
+    """Save a Python object to a file using pickle."""
+    with open(filename, "wb") as file:  # Open the file in write-binary mode
+        pickle.dump(obj, file)
+
+
+def load_object(filename):
+    """Load a Python object from a pickle file."""
+    with open(filename, "rb") as file:  # Open the file in read-binary mode
+        return pickle.load(file)
 
 
 class RBMModel(RBM):
@@ -133,46 +150,58 @@ if len(sys.argv) > 2:
     wandb_active = True
 
 else:
+    print("no input")
     prior_name = "rbm"
-    prior_size = 8  # int(sys.argv[2])
+    prior_size = 16  # int(sys.argv[2])
     random_seed = 0
-    cuda_device_code = "7"
-    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device_code
-    dataset_arg = "tiny"
+    cuda_device_code = "1"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device_code
+    dataset_arg = "tartarus"
     backend_sim = True
     wandb_active = False
-
+# os.environ["CUDA_VISIBLE_DEVICES"]
 print(
     f"prior_name:{prior_name},prior_size:{prior_size},DEVICE:{DEVICE},cuda_device_code:{cuda_device_code},dataset_arg:{dataset_arg},random_seed:{random_seed}"
 )
 
 # DEVICE = 'cpu'
-batch_size = 256
+batch_size = 2028
 prior_dim = prior_size
 
 model_dim = embedding_dim = 256  # should be embedding_dim/n_attn_heads
-n_attn_heads = 16
-n_encoder_layers = 4
+n_attn_heads = 4
+n_encoder_layers = 2
 
-n_g_samples = 500
+n_g_samples = 1000
 
-dropout = 0.2
+dropout = 0.35912916665692707  # 0.2
 
-n_epochs = 30
-learning_rate = 0.001
-gradient_accumulation_steps = 4
+n_epochs = 100
+learning_rate = 0.0006225117554833231  # 1e-3
+min_learning_rate = 1e-6
+gradient_accumulation_steps = 5
 
-n_qcbm_layers = 4
 n_epochs_prior = 30
-n_test_samples = 500
+n_test_samples = 1000
 
 # dataset_name = "/home/mghazi/workspace/insilico-drug-discovery/data/KRAS_G12D/KRAS_G12D_inhibitors_451_modified.csv"
 if dataset_arg == "tiny":
 
     dataset_name = "/root/qcbm/example/data/tiny.csv"
+
+elif dataset_arg == "tartarus":
+    dataset_name = "/root/generative-models/scripts/data/docking_hill_climbing_0.csv"
 else:
     dataset_name = "/root/qcbm/example/data/full.csv"
-selfies = Selfies.from_smiles_csv(dataset_name)
+
+
+pickle_name = dataset_name.split(".")[0]
+if os.path.isfile(f"{pickle_name}.pkl"):
+    selfies = load_object(f"{pickle_name}.pkl")
+else:
+    selfies = Selfies.from_smiles_csv(dataset_name)
+    save_object(selfies, f"{pickle_name}.pkl")
+
 smiles_dataset_df = pd.read_csv(dataset_name)
 smiles_dataset = smiles_dataset_df.smiles.to_list()
 
@@ -182,33 +211,26 @@ dl_shuffler = torch.Generator()
 dl_shuffler.manual_seed(random_seed)
 
 
-if backend_sim:
-    # backend = service.backend("ibm_quebec")  # Using IBM Quebec backend
-
-    backend = Aer.get_backend("aer_simulator")
-    print("using Simulator")
-
-
 if prior_name == "random":
     prior = GaussianPrior(dim=prior_dim)
     prior_trainable = False
-elif prior_name == "qcbm":
-    entangling_layer_builder = LineEntanglingLayerBuilder(prior_dim)
-    ansatz = EntanglingLayerAnsatz(
-        prior_dim, n_qcbm_layers, entangling_layer_builder, use_rxx=False
-    )
+# elif prior_name == "qcbm":
+#     entangling_layer_builder = LineEntanglingLayerBuilder(prior_dim)
+#     ansatz = EntanglingLayerAnsatz(
+#         prior_dim, n_qcbm_layers, entangling_layer_builder, use_rxx=False
+#     )
 
-    options = {
-        "maxiter": 5,  # Maximum number of iterations
-        "tol": 1e-6,  # Tolerance for termination
-        "disp": True,  # Display convergence messages
-    }
-    # Powell
-    optimizer = ScipyOptimizer(method="COBYLA", options=options)
+# options = {
+#     "maxiter": 5,  # Maximum number of iterations
+#     "tol": 1e-6,  # Tolerance for termination
+#     "disp": True,  # Display convergence messages
+# }
+# # Powell
+# optimizer = ScipyOptimizer(method="COBYLA", options=options)
 
-    prior = SingleBasisQCBM(ansatz, optimizer, distance_measure=ExactNLLTorch())
+# prior = SingleBasisQCBM(ansatz, optimizer, distance_measure=ExactNLLTorch())
 
-    prior_trainable = True
+# prior_trainable = True
 elif prior_name == "rbm":
     prior = RBMModel(
         n_visible=prior_dim,
@@ -224,7 +246,8 @@ elif prior_name == "rbm":
 
 run = wandb.init(
     # Set the project where this run will be logged
-    project=project_today,
+    # project=project_today,
+    project="QPat-RBM",
     name=f"{project_name}-{prior_name}-{prior_dim}",
     # Track hyperparameters and run metadata
 )
@@ -240,6 +263,7 @@ wandb.config = {
     "prior_name": prior_name,
     "gpu_no": torch.cuda.device_count(),
     "project_dir_path": project_dir_path,
+    "schduler": f"CosineAnnealingLR(optimizer, T_max={n_epochs}, eta_min={min_learning_rate})",
 }
 
 
@@ -254,7 +278,7 @@ model = CausalMolPAT(
     dropout=dropout,
     padding_token_idx=selfies.pad_index,
 )
-
+# model = torch.compile(model)
 if torch.cuda.device_count() > 1:
     print("Let's use", torch.cuda.device_count(), "GPUs!")
     # Wrap the model with nn.DataParallel
@@ -263,10 +287,12 @@ if torch.cuda.device_count() > 1:
 
 
 wandb.watch(model, log_freq=100)
-
+# model = torch.compile(model)
 model.to(DEVICE)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=min_learning_rate)
 print(DEVICE)
 
 
@@ -279,14 +305,26 @@ selfies_dl = DataLoader(
 )
 
 # rewards
-filter_lists = [GeneralFilter(), PainFilter(), WehiMCFilter()]  # ,SybaFilter()]
-weight_lists = [15.0, 5.0, 5.0]  # , 30.0]
+filter_lists = [TartarusFilters()]  # ,SybaFilter()]
+weight_lists = [5.0]  # , 30.0]
 
 novelity = MoleculeNovelty(smiles_dataset, threshold=0.6)
 filter = ConditionFilters(filter_lists=filter_lists, weight_lists=weight_lists)
 
 # get_diversity
 
+
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# Non-trainable parameters
+non_trainable_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+
+print(f"Trainable parameters: {trainable_params}")
+print(f"Non-trainable parameters: {non_trainable_params}")
+wandb.config.update(
+    {"nt_parameter": non_trainable_params, "t_parameter": trainable_params}
+)
+# exit()
 # training loop
 for epoch in range(n_epochs):
     model.train()
@@ -296,22 +334,7 @@ for epoch in range(n_epochs):
         for step, tensor_batch in enumerate(selfies_dl):
             tensor_batch.to(DEVICE)
             if prior_trainable:
-                if prior_name == "qcbm":
-                    with Session(
-                        service=service, backend=backend, max_time=3600
-                    ) as session:
-                        sampler = Sampler()
-                        sampler.set_options(
-                            session=session,
-                            resilience_level=2,
-                            optimization_level=3,
-                            error_mitigation={"method": "zne"},
-                            shots=tensor_batch.batch_size,
-                        )
-                        prior_samples = prior.generate(
-                            tensor_batch.batch_size, sampler, backend
-                        ).to(DEVICE)
-                elif prior_name == "rbm":
+                if prior_name == "rbm":
                     # torch.tensor(np.asarray(prior.generate(2,1))).to("cuda:0")
                     prior_samples = torch.tensor(
                         np.asarray(
@@ -325,7 +348,9 @@ for epoch in range(n_epochs):
                 prior_samples = prior.generate(tensor_batch.batch_size).to(DEVICE)
 
             total_loss = compute_transformer_loss(
-                model, tensor_batch, prior_samples=prior_samples
+                model,
+                tensor_batch,
+                prior_samples=prior_samples,
             )
 
             total_loss.backward()
@@ -333,6 +358,7 @@ for epoch in range(n_epochs):
             if step % gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
+                # scheduler.step()
 
             step_losses = {"total_loss": total_loss.item()}
 
@@ -348,32 +374,7 @@ for epoch in range(n_epochs):
     # generate a few samples and save them as JSON locally and to WandB
     model.eval()
     if prior_trainable:
-        # Start a session
-        if prior_name == "qcbm":
-            with Session(service=service, backend=backend, max_time=3600) as session:
-                # sampler = Sampler(session=session,resilience_level =2, optimization_level=3,error_mitigation={"method": "zne"} )
-                sampler = Sampler()
-                sampler.set_options(
-                    session=session,
-                    resilience_level=2,
-                    optimization_level=3,
-                    error_mitigation={"method": "zne"},
-                    shots=n_test_samples,
-                )
-                if epoch >= 1:
-                    x_input = generated_before.cpu().numpy()
-
-                    result = prior.train_on_batch(
-                        x_input.astype(np.int64),
-                        probs.cpu().numpy(),
-                        sampler,
-                        backend,
-                        n_epochs_prior,
-                    )
-                test_prior_samples_before = prior.generate(
-                    n_test_samples, sampler, backend
-                ).to(DEVICE)
-        elif prior_name == "rbm":
+        if prior_name == "rbm":
             if epoch >= 1:
 
                 x_input = generated_before.cpu().numpy()
@@ -391,14 +392,22 @@ for epoch in range(n_epochs):
         device=DEVICE,
         dtype=torch.int,
     )
-    generated_before_mol = model.generate(
-        start_tokens, test_prior_samples_before, max_new_tokens=selfies.max_length
-    )
+    # generated_before_mol = model.generate(
+    #     start_tokens, test_prior_samples_before, max_new_tokens=selfies.max_length
+    # )
+    if isinstance(model, torch.nn.DataParallel):
+        generated_before_mol = model.module.generate(
+            start_tokens, test_prior_samples_before, max_new_tokens=selfies.max_length
+        )
+    else:
+        generated_before_mol = model.generate(
+            start_tokens, test_prior_samples_before, max_new_tokens=selfies.max_length
+        )
     test_molecules = selfies.decode(generated_before_mol.cpu().numpy())
     # print(test_molecules)
 
     ligands_before = selfies.selfie_to_smiles(test_molecules)
-    # novelity_rate = novelity.get_novelity_smiles(ligands)
+    novelity_rate = novelity.get_novelity_smiles(ligands_before)
     sr_rate_before = filter.get_validity_smiles(ligands_before)
     diversity_rate_before = get_diversity(ligands_before)
 
@@ -411,40 +420,30 @@ for epoch in range(n_epochs):
     # print(probs)
     if prior_trainable:
         # Start a session
-        if prior_name == "qcbm":
-            with Session(service=service, backend=backend, max_time=3600) as session:
-                # sampler = Sampler(session=session,resilience_level =2, optimization_level=3,error_mitigation={"method": "zne"} )
-                sampler = Sampler()
-                sampler.set_options(
-                    session=session,
-                    resilience_level=2,
-                    optimization_level=3,
-                    error_mitigation={"method": "zne"},
-                    shots=n_test_samples,
-                )
-                test_prior_samples_after = prior.generate(
-                    n_test_samples, sampler, backend
-                ).to(DEVICE)
-                path_to_qcbm_params = f"{project_dir_path}/hw_param_train_{prior_dim}_qubits_{n_qcbm_layers}_layer_linear.json"
-                prior.save_params(path_to_qcbm_params)
-                # for sample, prob in zip(test_prior_samples_after, probabilities):
-                #     print(f"Sample: {sample}, Probability: {prob}")
-                wandb.save(path_to_qcbm_params)
-        elif prior_name == "rbm":
+        if prior_name == "rbm":
             test_prior_samples_after = torch.tensor(
                 np.asarray(prior.generate(n_test_samples, random_seed=random_seed))
             ).to(DEVICE)
+        if isinstance(model, torch.nn.DataParallel):
+            generated_after = model.module.generate(
+                start_tokens,
+                test_prior_samples_after,
+                max_new_tokens=selfies.max_length,
+            )
+        else:
+            generated_after = model.generate(
+                start_tokens,
+                test_prior_samples_after,
+                max_new_tokens=selfies.max_length,
+            )
 
-        generated_after = model.generate(
-            start_tokens, test_prior_samples_after, max_new_tokens=selfies.max_length
-        )
         test_molecules_after = selfies.decode(generated_after.cpu().numpy())
         # print(test_molecules)
 
         ligands_after = selfies.selfie_to_smiles(test_molecules_after)
         sr_rate_after = filter.get_validity_smiles(ligands_before)
         diversity_rate_after = get_diversity(ligands_before)
-        # novelity_rate = novelity.get_novelity_smiles(ligands)
+        novelity_rate = novelity.get_novelity_smiles(ligands_before)
     sr_rate_before = filter.get_validity_smiles(ligands_before)
     print(
         f"sr_rate_before:{sr_rate_before},diversity_rate_before:{diversity_rate_before}"
@@ -464,6 +463,7 @@ for epoch in range(n_epochs):
         {
             "sr_rate_before": sr_rate_before,
             "sr_rate_after": sr_rate_after,
+            "novelity_rate_before": novelity_rate,
             "diversity_rate_before": diversity_rate_before,
             "diversity_rate_after": diversity_rate_after,
         }
@@ -471,9 +471,13 @@ for epoch in range(n_epochs):
 
     # Optionally save your model at the end of each epoch or only at the end of training
     model_save_path = f"{project_dir_path}/model_epoch_{epoch}.pt"
+    samples_epoch_save_path = f"{project_dir_path}/samples_epoch_{epoch}.csv"
+    df = pd.DataFrame({"smiles": ligands_after})
+    df.to_csv(samples_epoch_save_path)
     torch.save(model.state_dict(), model_save_path)
 
     wandb.save(model_save_path)
+    wandb.save(samples_epoch_save_path)
     # UNCOMMENT to save samples as JSON
     # with open(f"test_molecules-{epoch}.json", "w") as f:
     #     json.dump(test_molecules, f)
@@ -486,21 +490,7 @@ save_obj(
 
 # sample from the train model
 if prior_trainable:
-    if prior_name == "qcbm":
-        with Session(service=service, backend=backend, max_time=3600) as session:
-            # sampler = Sampler(session=session,resilience_level =2, optimization_level=3,error_mitigation={"method": "zne"} )
-            sampler = Sampler()
-            sampler.set_options(
-                session=session,
-                resilience_level=2,
-                optimization_level=3,
-                error_mitigation={"method": "zne"},
-                shots=n_g_samples,
-            )
-            test_prior_samples = prior.generate(n_g_samples, sampler, backend).to(
-                DEVICE
-            )
-    elif prior_name == "rbm":
+    if prior_name == "rbm":
         test_prior_samples = torch.tensor(
             np.asarray(prior.generate(n_g_samples, random_seed=random_seed))
         ).to(DEVICE)
@@ -513,13 +503,23 @@ start_tokens = torch.full(
     device=DEVICE,
     dtype=torch.int,
 )
-generated = model.module.generate(
-    start_tokens, test_prior_samples, max_new_tokens=selfies.max_length
-)
+
+if isinstance(model, torch.nn.DataParallel):
+    generated = model.module.generate(
+        start_tokens, test_prior_samples, max_new_tokens=selfies.max_length
+    )
+else:
+    generated = model.generate(
+        start_tokens, test_prior_samples, max_new_tokens=selfies.max_length
+    )
+
+
 test_molecules = selfies.decode(generated.cpu().numpy())
 
 ligands = selfies.selfie_to_smiles(test_molecules)
 df = pd.DataFrame({"smiles": ligands})
-df.to_csv(f"{project_dir_path}/g_smiles.csv")
+final_path_save = f"{project_dir_path}/g_smiles.csv"
+df.to_csv(final_path_save)
+wandb.save(final_path_save)
 # f"{project_dir_path}/model_final.pkl")
 wandb.finish()

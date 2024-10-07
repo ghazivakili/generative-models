@@ -2,7 +2,13 @@ import torch
 from torch import nn
 from torch.nn import Module
 
-from qumedl.models.layers import Concatenate, PositionalEncoding, Repeat, ProjectXAddY
+from qumedl.models.layers import (
+    Concatenate,
+    PositionalEncoding,
+    Repeat,
+    ProjectXAddY,
+    ProjectXxY,
+)
 from .utils import create_lookahead_mask, create_padding_mask
 
 
@@ -51,7 +57,8 @@ class CausalMolPAT(nn.Module):
 
         # to decouple dimension of prior samples and embedding dimension
         # we project prior samples to the embedding dimension
-        self.projectx_addy = ProjectXAddY(prior_dim, target_dim=embedding_dim)
+        # self.projectx_addy = ProjectXAddY(prior_dim, target_dim=embedding_dim)
+        self.projectx_addy = ProjectXxY(prior_dim, target_dim=embedding_dim)
 
         # placeholder for visibility
         self.repeat: Module = nn.Identity()
