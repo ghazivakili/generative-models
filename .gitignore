@@ -165,3 +165,7 @@ cython_debug/
 cifar/*
 mlruns/*
 2024*
+
+
+
+scripts/wandb/*
